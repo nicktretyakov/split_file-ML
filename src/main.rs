@@ -1,96 +1,135 @@
-use tokio::io::{AsyncReadExt, BufReader};
-use anyhow::Result;
+use ndarray::{Array1, Array2};
+use regex::Regex;
+use smartcore::ensemble::random_forest_classifier::RandomForestClassifier;
+use smartcore::linalg::naive::dense_matrix::DenseMatrix;
+use std::collections::{HashMap, HashSet};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    println!("Simple text segmentation tool");
-    println!("Reading from stdin...");
-    
-    let mut buffer = String::new();
-    let mut accumulated_text = String::new();
-    let mut sentence_count = 0;
-    let mut stream = BufReader::new(tokio::io::stdin());
-    let mut buf = [0u8; 1024];
-
-    loop {
-        // Обработка всех полных предложений в буфере
-        while let Some(sentence) = extract_sentence(&mut buffer) {
-            // Простая эвристика на основе длины предложения и ключевых слов
-            let should_start_new_segment = should_segment(&accumulated_text, &sentence, sentence_count);
-            
-            if sentence_count == 0 || should_start_new_segment {
-                if !accumulated_text.is_empty() {
-                    // Вывод предыдущего сегмента
-                    println!("----- ЧАСТЬ -----\n{}", accumulated_text);
-                }
-                // Начало нового сегмента
-                accumulated_text = sentence;
-                sentence_count = 1;
-            } else {
-                // Добавление предложения к текущему сегменту
-                accumulated_text.push(' ');
-                accumulated_text.push_str(&sentence);
-                sentence_count += 1;
-            }
-        }
-        
-        // Чтение следующего куска данных из потока
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            // Вывод последнего сегмента
-            if !accumulated_text.is_empty() {
-                println!("----- ЧАСТЬ -----\n{}", accumulated_text);
-            }
-            break;
-        }
-        buffer.push_str(&String::from_utf8_lossy(&buf[..n]));
-    }
-    Ok(())
+fn tokenize(sentence: &str) -> Vec<String> {
+    sentence
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect()
 }
 
-// Функция для извлечения предложений из буфера
-fn extract_sentence(buffer: &mut String) -> Option<String> {
-    for (i, c) in buffer.char_indices() {
-        if c == '.' || c == '?' || c == '!' {
-            if i + 1 < buffer.len() && buffer.as_bytes()[i + 1] == b' ' {
-                let sentence = buffer[..=i].to_string();
-                *buffer = buffer[i + 2..].to_string();
-                return Some(sentence);
-            }
-        }
-    }
-    None
+struct TfidfModel {
+    vocab: Vec<String>,
+    idf: HashMap<String, f64>,
 }
 
-// Простая эвристика для определения смены сегмента
-fn should_segment(current_text: &str, new_sentence: &str, sentence_count: usize) -> bool {
-    // Начинаем новый сегмент каждые 5 предложений
-    if sentence_count >= 5 {
-        return true;
+impl TfidfModel {
+    fn new(sentences: &[&str]) -> Self {
+        let mut vocab_set = HashSet::new();
+        for sentence in sentences {
+            for word in tokenize(sentence) {
+                vocab_set.insert(word);
+            }
+        }
+        let vocab: Vec<String> = vocab_set.into_iter().collect();
+        let mut idf = HashMap::new();
+        let n_docs = sentences.len() as f64;
+        for word in &vocab {
+            let df = sentences
+                .iter()
+                .filter(|s| tokenize(s).contains(word))
+                .count() as f64;
+            let idf_value = (n_docs / (df + 1.0)).ln();
+            idf.insert(word.clone(), idf_value);
+        }
+        TfidfModel { vocab, idf }
     }
-    
-    // Ключевые слова, указывающие на смену темы
-    let topic_markers = [
-        "однако", "тем не менее", "в то же время", "с другой стороны",
-        "кроме того", "более того", "в дополнение", "также",
-        "например", "в частности", "а именно",
-        "в заключение", "таким образом", "итак", "следовательно"
+
+    fn transform(&self, sentence: &str) -> Array1<f64> {
+        let words = tokenize(sentence);
+        let mut tf = HashMap::new();
+        for word in &words {
+            *tf.entry(word.clone()).or_insert(0.0) += 1.0;
+        }
+        let mut vector = Array1::zeros(self.vocab.len());
+        for (i, word) in self.vocab.iter().enumerate() {
+            if let Some(count) = tf.get(word) {
+                let tf_value = *count / words.len() as f64;
+                let idf_value = self.idf[word];
+                vector[i] = tf_value * idf_value;
+            }
+        }
+        vector
+    }
+}
+
+fn cosine_similarity(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    let dot_product = a.dot(b);
+    let norm_a = a.dot(a).sqrt();
+    let norm_b = b.dot(b).sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot_product / (norm_a * norm_b)
+    }
+}
+
+fn extract_features(sentences: &[&str]) -> Array2<f64> {
+    let tfidf_model = TfidfModel::new(sentences);
+    let tfidf_vectors: Vec<Array1<f64>> =
+        sentences.iter().map(|s| tfidf_model.transform(s)).collect();
+
+    let re = Regex::new(r"(?i)Introduction|Methods|Results").unwrap();
+
+    let mut features = Vec::new();
+    for i in 0..sentences.len() {
+        let has_section_keyword = if re.is_match(sentences[i]) { 1.0 } else { 0.0 };
+        let cosine_dist = if i > 0 {
+            let a = &tfidf_vectors[i];
+            let b = &tfidf_vectors[i - 1];
+            1.0 - cosine_similarity(a, b)
+        } else {
+            0.0
+        };
+        let sentence_length = tokenize(sentences[i]).len() as f64;
+        features.push(vec![has_section_keyword, cosine_dist, sentence_length]);
+    }
+    Array2::from_shape_vec(
+        (sentences.len(), 3),
+        features.into_iter().flatten().collect(),
+    )
+    .unwrap()
+}
+
+fn predict_segments(model: &RandomForestClassifier<f64>, new_sentences: &[&str]) -> Vec<f64> {
+    let X_new = extract_features(new_sentences);
+    let X_new_vec: Vec<Vec<f64>> = X_new.outer_iter().map(|row| row.to_vec()).collect();
+    let X_new_dm = DenseMatrix::from_2d_vec(&X_new_vec);
+    model.predict(&X_new_dm).unwrap()
+}
+
+fn main() {
+    let texts = vec![
+        "Introduction. This study explores...",
+        "We used a novel method...",
+        "Methods. The experiment was...",
+        "Data was collected from...",
+        "Results. The findings show...",
     ];
-    
-    let sentence_lower = new_sentence.to_lowercase();
-    for marker in &topic_markers {
-        if sentence_lower.contains(marker) {
-            return true;
-        }
+    let labels = vec![1.0, 0.0, 1.0, 0.0, 1.0];
+
+    let X = extract_features(&texts);
+    let X_vec: Vec<Vec<f64>> = X.outer_iter().map(|row| row.to_vec()).collect();
+    let X_train = DenseMatrix::from_2d_vec(&X_vec);
+
+    let model = RandomForestClassifier::<f64>::fit(&X_train, &labels, Default::default()).unwrap();
+
+    let new_texts = vec![
+        "Abstract. This paper discusses...",
+        "The approach was tested...",
+        "Conclusion. We found that...",
+    ];
+
+    let predictions = predict_segments(&model, &new_texts);
+
+    for (text, pred) in new_texts.iter().zip(predictions.iter()) {
+        println!(
+            "Sentence: {} | New segment: {}",
+            text,
+            if *pred == 1.0 { "true" } else { "false" }
+        );
     }
-    
-    // Если предложение значительно длиннее или короче предыдущих
-    let avg_length = if current_text.is_empty() { 0 } else { current_text.len() / sentence_count.max(1) };
-    let new_length = new_sentence.len();
-    
-    if avg_length > 0 && (new_length > avg_length * 2 || new_length < avg_length / 2) {
-        return sentence_count > 2; // Но не слишком рано
-    }
-    
-    false
 }
