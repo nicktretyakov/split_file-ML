@@ -1,60 +1,47 @@
-use rust_bert::pipelines::sentence_embeddings::{SentenceEmbeddingsBuilder, SentenceEmbeddingsModel};
-use ndarray::Array1;
 use tokio::io::{AsyncReadExt, BufReader};
-use std::sync::Arc;
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Инициализация модели для вычисления вложений предложений
-    let model = Arc::new(SentenceEmbeddingsBuilder::new("bert-base-nli-mean-tokens").create_model()?);
-    let threshold = 0.5; // Порог для определения смены темы
+    println!("Simple text segmentation tool");
+    println!("Reading from stdin...");
+    
     let mut buffer = String::new();
     let mut accumulated_text = String::new();
-    let mut centroid: Option<Array1<f32>> = None;
-    let mut count = 0;
+    let mut sentence_count = 0;
     let mut stream = BufReader::new(tokio::io::stdin());
     let mut buf = [0u8; 1024];
 
     loop {
         // Обработка всех полных предложений в буфере
         while let Some(sentence) = extract_sentence(&mut buffer) {
-            let model = model.clone();
-            // Вычисление вложения предложения в отдельном потоке
-            let embedding = tokio::task::spawn_blocking(move || {
-                let embeddings = model.encode(&[&sentence])?;
-                Ok(embeddings[0].clone())
-            }).await??;
-            // Нормализация вложения
-            let embedding = embedding / embedding.dot(&embedding).sqrt();
-
-            if count == 0 {
-                // Первое предложение в сегменте
-                accumulated_text = sentence;
-                centroid = Some(embedding.clone());
-                count = 1;
-            } else {
-                // Вычисление сходства с текущим центроидом
-                let current_centroid = centroid.as_ref().unwrap();
-                let similarity = current_centroid.dot(&embedding) / current_centroid.dot(current_centroid).sqrt();
-                if similarity >= threshold {
-                    // Добавление предложения к текущему сегменту
-                    accumulated_text.push_str(&sentence);
-                    *centroid.as_mut().unwrap() += &embedding;
-                    count += 1;
-                } else {
-                    // Вывод сегмента при смене темы
+            // Простая эвристика на основе длины предложения и ключевых слов
+            let should_start_new_segment = should_segment(&accumulated_text, &sentence, sentence_count);
+            
+            if sentence_count == 0 || should_start_new_segment {
+                if !accumulated_text.is_empty() {
+                    // Вывод предыдущего сегмента
                     println!("----- ЧАСТЬ -----\n{}", accumulated_text);
-                    accumulated_text = sentence;
-                    centroid = Some(embedding.clone());
-                    count = 1;
                 }
+                // Начало нового сегмента
+                accumulated_text = sentence;
+                sentence_count = 1;
+            } else {
+                // Добавление предложения к текущему сегменту
+                accumulated_text.push(' ');
+                accumulated_text.push_str(&sentence);
+                sentence_count += 1;
             }
         }
+        
         // Чтение следующего куска данных из потока
         let n = stream.read(&mut buf).await?;
         if n == 0 {
-            break; // Для конечных потоков, хотя предполагается бесконечность
+            // Вывод последнего сегмента
+            if !accumulated_text.is_empty() {
+                println!("----- ЧАСТЬ -----\n{}", accumulated_text);
+            }
+            break;
         }
         buffer.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
@@ -73,4 +60,37 @@ fn extract_sentence(buffer: &mut String) -> Option<String> {
         }
     }
     None
+}
+
+// Простая эвристика для определения смены сегмента
+fn should_segment(current_text: &str, new_sentence: &str, sentence_count: usize) -> bool {
+    // Начинаем новый сегмент каждые 5 предложений
+    if sentence_count >= 5 {
+        return true;
+    }
+    
+    // Ключевые слова, указывающие на смену темы
+    let topic_markers = [
+        "однако", "тем не менее", "в то же время", "с другой стороны",
+        "кроме того", "более того", "в дополнение", "также",
+        "например", "в частности", "а именно",
+        "в заключение", "таким образом", "итак", "следовательно"
+    ];
+    
+    let sentence_lower = new_sentence.to_lowercase();
+    for marker in &topic_markers {
+        if sentence_lower.contains(marker) {
+            return true;
+        }
+    }
+    
+    // Если предложение значительно длиннее или короче предыдущих
+    let avg_length = if current_text.is_empty() { 0 } else { current_text.len() / sentence_count.max(1) };
+    let new_length = new_sentence.len();
+    
+    if avg_length > 0 && (new_length > avg_length * 2 || new_length < avg_length / 2) {
+        return sentence_count > 2; // Но не слишком рано
+    }
+    
+    false
 }
